@@ -102,6 +102,7 @@ run = "npx eslint ."
 [tasks."lint:deb"]
 description = "Lintian the built .deb (native if lintian present, else Debian container)"
 run = """
+#!/usr/bin/env bash
 set -euo pipefail
 
 if command -v lintian >/dev/null 2>&1; then
@@ -160,6 +161,7 @@ description = "Build the .deb package (native in CI, dockerized otherwise)"
 # Both paths deposit the finished artifacts in ./dist (inside the repo). Nothing
 # is ever written outside the project directory.
 run = '''
+#!/usr/bin/env bash
 set -euo pipefail
 
 if [ "{{ vars.ci }}" = "true" ]; then
@@ -177,6 +179,7 @@ description = "Build the .deb natively (requires a Debian host with the toolchai
 # a throwaway copy under ./.build-tmp (so "the parent dir" is itself in-tree and
 # ephemeral), then move the finished artifacts into ./dist.
 run = '''
+#!/usr/bin/env bash
 set -euo pipefail
 
 root="{{ config_root }}"
@@ -219,6 +222,7 @@ description = "Build the .deb inside a throwaway Debian container"
 # land in the ephemeral container FS, then move them into the mounted repo's
 # ./dist. Nothing is ever written to the host outside the project directory.
 run = '''
+#!/usr/bin/env bash
 set -euo pipefail
 
 image="${PVE_MODKIT_BUILD_IMAGE:-debian:trixie}"
@@ -278,6 +282,7 @@ depends = [
 hide = true
 description = "Fail-loud runtime smoke test: exercise Template + PPI code paths"
 run = """
+#!/usr/bin/env bash
 set -euo pipefail
 
 # (a) Hard assertion that both CPAN modules actually load. The CLI treats a
