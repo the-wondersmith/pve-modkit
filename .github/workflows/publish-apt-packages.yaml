@@ -1,0 +1,30 @@
+---
+name: Publish to APT repository
+
+# On every published release, tell `the-wondersmith/apt` to ingest the
+# release's `.deb` assets. Authenticated by the APT_DISPATCH_TOKEN secret
+# (a durable, dispatch-only fine-grained PAT). Both this workflow and the
+# `APT_DISPATCH_TOKEN` secret are seeded by the `the-wondersmith/apt`'s
+# onboarding workflow automatically.
+
+on:
+  release:
+    types:
+      - published
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch publish-deb to the APT control plane
+        env:
+          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+          SOURCE_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+        run: |
+          jq -n \
+            --arg tag "${RELEASE_TAG}" \
+            --arg repo "${SOURCE_REPO}" \
+            '{event_type: "publish-deb", client_payload: {tag: $tag, repo: $repo}}' \
+          | gh api -X POST /repos/the-wondersmith/apt/dispatches --input -
