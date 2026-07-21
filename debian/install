@@ -1,0 +1,4 @@
+src/bin/pve-modkit usr/libexec/pve-modkit/bin/
+src/share/ext.js usr/share/pve-modkit/mods/
+src/mods/modkit-active-badge/mod.json usr/share/pve-modkit/mods/modkit-active-badge/
+src/mods/modkit-active-badge/index.js usr/share/pve-modkit/mods/modkit-active-badge/

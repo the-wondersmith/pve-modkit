@@ -1,0 +1,352 @@
+[hooks]
+enter = ["{{ mise_bin }} install", "pre-commit install --install-hooks"]
+# Template Toolkit and PPI are CPAN modules with no mise backend, so they are
+# installed imperatively here against the mise-provided perl (aqua:skaji/
+# relocatable-perl, which bundles cpanm on PATH). Plain, unpinned, latest.
+# Escape hatch if pinning is ever needed: replace this with a cpanfile and
+# `cpanm --installdeps .`, or pin explicitly via `cpanm Template@<ver> PPI@<ver>`.
+postinstall = "cpanm --notest Template PPI Perl::Critic Perl::Tidy"
+
+[env]
+_.path = "{{ config_root }}/.local/bin"
+
+[vars]
+# Check if running in CI context (e.g. GitHub Actions)
+ci = "{{ env.CI is defined and env.CI == 'true' }}"
+
+[tools]
+actionlint = "1.7"
+editorconfig-checker = "3"
+# perl provides the runtime for the pve-modkit CLI's lazily-required Template
+# and PPI modules (see the postinstall hook above). Ungated: mise is the single
+# source of truth for tooling on every host (CI, build box, dev machines).
+perl = "latest"
+pre-commit = "4"
+shellcheck = "latest"
+shfmt = "3"
+yamllint = "latest"
+yq = "4"
+
+[settings]
+lockfile = true
+gpg_verify = true
+auto_install = true
+experimental = true
+
+[settings.status]
+missing_tools = "always"
+
+[tasks.lint]
+description = "Run all lint checks"
+depends = [
+  "lint:perl",
+  "lint:perlcritic",
+  "lint:perltidy",
+  "lint:shell",
+  "lint:yaml",
+  "lint:actions",
+  "lint:js",
+]
+
+[tasks."lint:perl"]
+hide = true
+description = "Syntax-check the pve-modkit Perl CLI"
+run = "perl -c src/bin/pve-modkit"
+
+[tasks."lint:shell"]
+hide = true
+description = "Shellcheck the maintainer/dev shell scripts"
+run = """
+shellcheck \
+  debian/postinst \
+  debian/prerm \
+  debian/postrm \
+  .devcontainer/postCreateCommand.sh
+"""
+
+[tasks."lint:yaml"]
+hide = true
+description = "Lint YAML files"
+run = "yamllint -c .yamllint.yaml ."
+
+[tasks."lint:actions"]
+hide = true
+description = "Lint GitHub Actions workflows"
+run = "actionlint"
+
+[tasks."lint:perlcritic"]
+hide = true
+description = "Perl::Critic static analysis (brutal, see .perlcriticrc)"
+run = "perlcritic src/bin/pve-modkit"
+
+[tasks."lint:perltidy"]
+hide = true
+description = "Perl::Tidy formatting (check-only in CI, autofix locally)"
+run = """
+if [ "{{ vars.ci }}" = "true" ]; then
+  perltidy --assert-tidy -o /dev/null src/bin/pve-modkit
+else
+  perltidy src/bin/pve-modkit
+fi
+"""
+
+[tasks."lint:js"]
+hide = true
+description = "ESLint the browser loader + mod scripts"
+run = "npx eslint ."
+
+[tasks."lint:deb"]
+description = "Lintian the built .deb (native if lintian present, else Debian container)"
+run = """
+set -euo pipefail
+
+if command -v lintian >/dev/null 2>&1; then
+  echo "==> running lintian natively"
+  mise run build:native
+  lintian --fail-on error,warning dist/pve-modkit_*.deb
+  exit 0
+fi
+
+image="${PVE_MODKIT_BUILD_IMAGE:-debian:trixie}"
+
+if command -v docker >/dev/null 2>&1; then
+  runner="docker"
+elif command -v podman >/dev/null 2>&1; then
+  runner="podman"
+else
+  echo "error: neither lintian, docker, nor podman found" >&2
+  exit 1
+fi
+
+echo "==> running lintian in ${runner} (${image})"
+exec "${runner}" run --rm \
+  -e DEBIAN_FRONTEND=noninteractive \
+  -v "{{ config_root }}:/build/src" \
+  -w /build/src \
+  --entrypoint bash \
+  "${image}" -euo pipefail -c '
+    apt-get update -qq
+    apt-get install -y --no-install-recommends \
+      lintian dpkg-dev debhelper libtemplate-perl libppi-perl build-essential >/dev/null
+    mkdir -p /build/work/pve-modkit
+    tar -C /build/src --exclude=./.git --exclude=./dist --exclude=./node_modules -cf - . \
+      | tar -C /build/work/pve-modkit -xf -
+    (cd /build/work/pve-modkit && dpkg-buildpackage -us -uc -b)
+    lintian --fail-on error,warning /build/work/pve-modkit_*.deb
+  '
+"""
+
+[tasks.clean]
+description = "Remove build artifacts"
+run = """
+rm -rf debian/files \
+  debian/pve-modkit \
+  debian/.debhelper \
+  dist \
+  debian/debhelper-build-stamp
+"""
+
+[tasks.build]
+description = "Build the .deb package (native in CI, dockerized otherwise)"
+# Dispatch to the right builder: in CI (vars.ci) the runner is already a Debian
+# box with the packaging toolchain installed, so build natively. Everywhere
+# else (dev machines, including non-Debian hosts like macOS) delegate to the
+# dockerized build so `dpkg-buildpackage` is available without polluting the host.
+#
+# Both paths deposit the finished artifacts in ./dist (inside the repo). Nothing
+# is ever written outside the project directory.
+run = '''
+set -euo pipefail
+
+if [ "{{ vars.ci }}" = "true" ]; then
+  exec mise run build:native
+fi
+
+exec mise run build:docker
+'''
+
+[tasks."build:native"]
+hide = true
+description = "Build the .deb natively (requires a Debian host with the toolchain)"
+# dpkg-buildpackage hardcodes writing its artifacts to the parent directory and
+# offers no flag to change that. To keep everything inside the repo we build in
+# a throwaway copy under ./.build-tmp (so "the parent dir" is itself in-tree and
+# ephemeral), then move the finished artifacts into ./dist.
+run = '''
+set -euo pipefail
+
+root="{{ config_root }}"
+tmp="${root}/.build-tmp"
+src="${tmp}/pve-modkit"
+
+rm -rf "${tmp}"
+mkdir -p "${src}"
+# Copy the source tree into the throwaway build dir, excluding scratch/output.
+tar -C "${root}" \
+  --exclude='./.git' \
+  --exclude='./.build-tmp' \
+  --exclude='./dist' \
+  -cf - . | tar -C "${src}" -xf -
+
+( cd "${src}" && dpkg-buildpackage -us -uc -b )
+
+mkdir -p "${root}/dist"
+# Artifacts land in ${tmp} (the parent of ${src}); collect them into ./dist.
+find "${tmp}" -maxdepth 1 -type f \
+  \( -name 'pve-modkit_*.deb' \
+     -o -name 'pve-modkit_*.changes' \
+     -o -name 'pve-modkit_*.buildinfo' \) \
+  -exec mv -f {} "${root}/dist/" \;
+
+rm -rf "${tmp}"
+echo "build: artifacts in ${root}/dist"
+ls -1 "${root}/dist"
+'''
+
+[tasks."build:docker"]
+hide = true
+description = "Build the .deb inside a throwaway Debian container"
+# Build inside a throwaway Debian container so `dpkg-buildpackage` is available
+# without polluting the host. Override the image with PVE_MODKIT_BUILD_IMAGE if
+# a different base is wanted.
+#
+# The repo (and ONLY the repo) is mounted at /build/src. Inside the container we
+# copy the source to a sibling dir so dpkg-buildpackage's parent-dir artifacts
+# land in the ephemeral container FS, then move them into the mounted repo's
+# ./dist. Nothing is ever written to the host outside the project directory.
+run = '''
+set -euo pipefail
+
+image="${PVE_MODKIT_BUILD_IMAGE:-debian:trixie}"
+
+if command -v docker; then
+  runner='docker'
+elif command -v podman; then
+  runner='podman'
+fi
+
+if [ -z "${runner:-}" ]; then
+  echo "build: neither docker nor podman found; install one or run on a Debian host with CI=true" >&2
+  exit 1
+fi
+
+echo "build: running dpkg-buildpackage in ${runner} (${image})"
+exec "${runner}" run --rm \
+  -e DEBIAN_FRONTEND=noninteractive \
+  -v "{{ config_root }}:/build/src" \
+  -w /build/src \
+  --entrypoint bash \
+  "${image}" \
+  -euo pipefail -c '
+    apt update -qq
+    apt install -y --no-install-recommends \
+      dpkg-dev debhelper libppi-perl build-essential libtemplate-perl >/dev/null
+
+    # Copy source to an ephemeral sibling so dpkg-buildpackage writes its
+    # parent-dir artifacts inside the container, not onto the mounted repo.
+    mkdir -p /build/work/pve-modkit
+    tar -C /build/src --exclude=./.git --exclude=./dist -cf - . \
+      | tar -C /build/work/pve-modkit -xf -
+
+    ( cd /build/work/pve-modkit && dpkg-buildpackage -us -uc -b )
+
+    # Deposit finished artifacts into the mounted repo (./dist on the host).
+    mkdir -p /build/src/dist
+    find /build/work -maxdepth 1 -type f \
+      \( -name "pve-modkit_*.deb" \
+         -o -name "pve-modkit_*.changes" \
+         -o -name "pve-modkit_*.buildinfo" \) \
+      -exec mv -f {} /build/src/dist/ \;
+
+    echo "build: artifacts in ./dist"
+
+    ls -1 /build/src/dist
+  '
+'''
+
+[tasks.tests]
+description = "Run all tests"
+depends = [
+    "tests:smoke",
+]
+
+[tasks."tests:smoke"]
+hide = true
+description = "Fail-loud runtime smoke test: exercise Template + PPI code paths"
+run = """
+set -euo pipefail
+
+# (a) Hard assertion that both CPAN modules actually load. The CLI treats a
+#     missing Template as non-fatal (tt_ok returns -1 and still exits 0), so a
+#     naive `patch tpl` run would pass even with Template absent/half-built.
+#     This assertion fails loudly instead.
+if ! perl -MTemplate -MPPI -e 'exit 0'; then
+  echo "SMOKE FAIL: Template and/or PPI failed to load under this perl" >&2
+  exit 1
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+export PVE_MODKIT_BACKUP_DIR="${work}/backup"
+export PVE_MODKIT_STATE_DIR="${work}/state"
+mkdir -p "${PVE_MODKIT_BACKUP_DIR}" "${PVE_MODKIT_STATE_DIR}"
+
+# (b) Exercise the Template render-gate for real. A TT directive forces
+#     Template->process to run rather than being skipped.
+tpl="${work}/index.html.tpl"
+cat > "${tpl}" <<'TPL'
+<!DOCTYPE html>
+<html>
+<head>
+[% IF 1 %]<title>ok</title>[% END %]
+</head>
+<body></body>
+</html>
+TPL
+
+if ! perl src/bin/pve-modkit patch tpl --file "${tpl}"; then
+  echo "SMOKE FAIL: 'patch tpl' returned non-zero" >&2
+  exit 1
+fi
+
+if ! grep -q 'src="/modkit/ext.js"' "${tpl}"; then
+  echo "SMOKE FAIL: loader <script> was not injected into the tpl" >&2
+  exit 1
+fi
+
+# (c) Exercise the PPI path via 'patch pveproxy'. The lazy `require PPI` only
+#     fires when the target file exists, so provide a minimal fixture that
+#     carries the '/pve2/js/' add_dirs anchor the CLI splices after.
+pveproxy="${work}/pveproxy.pm"
+
+cat > "${pveproxy}" <<'PM'
+use strict;
+use warnings;
+
+sub register_directories {
+    my ($dirs) = @_;
+    add_dirs($dirs, '/pve2/js/' => '/usr/share/pve-manager/js/');
+}
+
+1;
+PM
+
+set +e
+
+perl src/bin/pve-modkit patch pveproxy --file "${pveproxy}"
+
+rc=$?
+
+set -e
+
+if [ "${rc}" -ne 10 ]; then
+  echo "SMOKE FAIL: 'patch pveproxy' exit code was ${rc}, expected 10 (write contract)" >&2
+  exit 1
+fi
+if ! grep -q "add_dirs(\\$dirs, '/modkit/'" "${pveproxy}"; then
+  echo "SMOKE FAIL: '/modkit/' add_dirs line was not spliced into pveproxy.pm" >&2
+  exit 1
+fi
+
+echo "SMOKE OK: Template render + PPI splice + exit-10 contract all verified"
+"""

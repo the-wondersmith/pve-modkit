@@ -1,0 +1,31 @@
+#!/usr/bin/make -f
+
+# pve-modkit is a native package that installs a handful of static payload
+# files. File placement is declared in debian/install (assets normalize to
+# 0644) and the empty backup dir in debian/dirs; the CLI's 0755 bit is
+# guaranteed by execute_after_dh_install below. We previously hand-installed
+# everything in override_dh_auto_install with install(1); to revert to that,
+# restore that target and drop debian/install + debian/dirs.
+#
+# The systemd units are named pve-modkit.{path,service} to match the package
+# name, so debhelper auto-discovers them without --name. The slim
+# override_dh_installsystemd below exists only to keep the oneshot .service
+# from being enabled/started directly (it has no [Install] and is triggered
+# solely by the .path watcher).
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# nothing to build
+
+override_dh_installsystemd:
+	# Enable + start ONLY the .path watcher (it has WantedBy=multi-user.target).
+	dh_installsystemd pve-modkit.path
+	# Install the oneshot .service but never enable/start it directly; it has
+	# no [Install] section and is triggered exclusively by the .path unit.
+	dh_installsystemd --no-enable --no-start pve-modkit.service
+
+execute_after_dh_install:
+	# debian/install normalizes files to 0644; the CLI must be executable.
+	chmod 0755 debian/pve-modkit/usr/libexec/pve-modkit/bin/pve-modkit

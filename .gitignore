@@ -1,0 +1,57 @@
+# IDE configuration
+.idea/
+.vscode/
+
+# Virtual environments
+**/.venv
+
+# Local configuration and caches
+**/.env
+**/.envrc
+**/.actrc
+**/.secrets
+**/reference
+
+# Local tooling
+.local/bin/
+.local/**/data
+
+# Node / ESLint (package-lock.json is committed for reproducible lint runs)
+node_modules/
+
+# Debian packaging. Ignore everything under debian/ by default (dpkg-buildpackage
+# scatters generated state throughout it), then carve out the source-controlled
+# files. Finished packages land in ./dist and the throwaway build copy in
+# ./.build-tmp (both ignored below).
+debian/*
+!debian/changelog
+!debian/control
+!debian/copyright
+!debian/dirs
+!debian/install
+!debian/postinst
+!debian/postrm
+!debian/prerm
+!debian/pve-modkit.path
+!debian/pve-modkit.service
+!debian/rules
+!debian/triggers
+# source/ is a directory; unignore it, then its tracked file.
+!debian/source/
+debian/source/*
+!debian/source/format
+
+dist/
+.build-tmp/
+*.deb
+*.buildinfo
+*.changes
+
+# Command output
+*.zip
+*.log
+
+# OS-specific rubbish
+*~
+.DS_Store
+._*

@@ -1,0 +1,893 @@
+#!/usr/bin/env perl
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# pve-modkit - unified CLI for the Proxmox VE web UI mod kit.
+#
+# Subcommands:
+#
+#   pve-modkit patch tpl [--file PATH] [--remove]
+#       Inject (or remove) the mod-loader <script> in pve-manager's
+#       index.html.tpl. Textual splice before the last </head>, wrapped in a
+#       backup + Template-Toolkit renderability gate + restore-on-failure
+#       envelope. Exits 0 (a template change only needs a pveproxy RELOAD).
+#
+#   pve-modkit patch pveproxy [--file PATH] [--remove]
+#       Register (or remove) the /modkit/ static dir key in pveproxy.pm via a
+#       PPI-confirmed, AST-guided textual splice, gated by `perl -c`, wrapped in
+#       backup + restore-on-failure. Exits 10 on a genuine write (the caller
+#       must FULLY RESTART pveproxy; a reload will not rebuild the $dirs table),
+#       0 on a no-op.
+#
+#   pve-modkit index [--dir DIR]
+#       Walk the per-mod subdirectories under DIR (default the mods dir), read
+#       each mod's mod.json, and (re)generate the top-level index.json manifest
+#       listing only ENABLED mods and their entry files, for the browser loader
+#       to consume. Loop-guarded: only writes when the manifest content changes.
+#
+#   pve-modkit sync [--dir DIR]
+#       Regenerate the manifest (as `index`) AND restart pveproxy when the SET of
+#       mod subdirectories changed since the last sync (a mod was installed or
+#       removed). This is what the systemd .path watcher runs: adding/removing a
+#       mod dir changes which /modkit/{mod}/ routes must be (un)registered, which
+#       only happens on a full pveproxy restart (its File::Find dir walk re-runs
+#       at init). A mere file edit inside an existing mod changes no route set, so
+#       no restart is issued -- only the manifest is refreshed if needed.
+#       When there is no prior dir-set on record (first sync after install, or
+#       after a reboot -- the state lives on tmpfs and is wiped on boot), sync
+#       restarts pveproxy if any mods are present, so their routes are guaranteed
+#       registered without any user action. This is what makes mod loading fully
+#       automatic: drop a mod folder in, refresh the browser, done.
+#
+#   pve-modkit enable  <mod> [<mod> ...]
+#   pve-modkit disable <mod> [<mod> ...]
+#       Flip the "enabled" flag in each named mod's mod.json, then regenerate
+#       the manifest. Enabling a mod whose subdirectory was not present at the
+#       last pveproxy init requires a pveproxy restart to become servable; the
+#       command advises this on stderr.
+#
+#   pve-modkit list   (alias: status)  [--dir DIR]
+#       Print a table of installed mods and their state: enabled/disabled,
+#       whether they are currently served (enabled + entry present + in the
+#       manifest), and their entry file (flagging a missing entry or an
+#       unparseable mod.json).
+#
+#   pve-modkit unpatch [--file-tpl PATH] [--file-pveproxy PATH]
+#       Convenience: remove BOTH patches (template + pveproxy.pm). Exits 10 if
+#       the pveproxy.pm dir key was actually removed (restart needed), else 0.
+#
+#   pve-modkit help
+#
+# Design constraints (carried from v2, do not regress):
+#   * index.html.tpl is a Template Toolkit template (~27 [% %] directives,
+#     invalid standalone HTML) -> only ever a surgical TEXTUAL splice, never an
+#     HTML parse/serialize round-trip.
+#   * pveproxy's static handler does an exact-hash-lookup on the URL dir prefix
+#     and its filename regex forbids slashes, so each served directory must be
+#     registered; per-mod subdirs are auto-registered by add_dirs' File::Find
+#     walk, but only for subdirs present at pveproxy init() -> a brand-new mod
+#     subdir needs a full RESTART to be served.
+#   * A missing target file is NOT an error (exit 0) so dpkg triggers stay quiet
+#     while pve-manager is only partially unpacked.
+
+use strict;
+use warnings;
+
+our $VERSION = '0.1.0';
+
+use File::Temp     qw(tempfile);
+use File::Copy     qw(copy);
+use File::Path     qw(make_path);
+use File::Basename qw(dirname);
+
+# ---------------------------------------------------------------------------
+# shared constants
+# ---------------------------------------------------------------------------
+my $TPL_DEFAULT      = '/usr/share/pve-manager/index.html.tpl';
+my $PVEPROXY_DEFAULT = '/usr/share/perl5/PVE/Service/pveproxy.pm';
+my $MODS_DIR         = '/usr/share/pve-modkit/mods';
+
+my $BACKUP_DIR = $ENV{PVE_MODKIT_BACKUP_DIR} || '/usr/share/pve-modkit/originals';
+
+# template loader tag
+my $TPL_MARKER = 'data-pve-modkit="loader"';
+my $TPL_TAG    = '<script src="/modkit/ext.js" data-pve-modkit="loader"></script>';
+my $TPL_BACKUP = 'index.html.tpl.bak';
+
+# pveproxy.pm dir key
+my $PP_MARKER = 'pve-modkit-served';
+my $PP_NEWLINE =
+    "    add_dirs(\$dirs, '/modkit/' => '/usr/share/pve-modkit/mods/'); # $PP_MARKER\n";
+my $PP_BACKUP = 'pveproxy.pm.bak';
+
+# manifest
+my $MANIFEST      = 'index.json';
+my $DEFAULT_ENTRY = 'index.js';
+
+# The mods dir also contains the loader itself (served as /modkit/ext.js) and
+# the generated manifest; both are expected, non-mod files that list_mod_dirs
+# must not mistake for (or warn about as) stray content.
+my $LOADER_FILE  = 'ext.js';
+my $MOD_NAME_MAX = 128;
+
+# Runtime state for `sync`: records the set of mod subdirectories seen at the
+# last sync so we can detect an install/removal (route-set change) vs a mere
+# file edit. Lives on tmpfs (/run), OUTSIDE the watched mods dir, so writing it
+# never re-fires the .path watcher and it resets cleanly on reboot (a reboot
+# re-runs pveproxy init anyway, so the routes are fresh).
+my $STATE_DIR  = $ENV{PVE_MODKIT_STATE_DIR} || '/run/pve-modkit';
+my $STATE_FILE = 'moddirs';
+
+# ===========================================================================
+# shared helpers
+# ===========================================================================
+sub slurp {
+    my ($file) = @_;
+    open my $fh, '<', $file or die "open $file: $!\n";
+    local $/ = undef;
+    my $data = <$fh>;
+    close $fh or warn "close $file: $!\n";
+    return $data;
+}
+
+sub backup_path { my ($name) = @_; return "$BACKUP_DIR/$name"; }
+
+# Preserve a copy before our own edit, refreshed each apply from the current
+# (pre-edit) on-disk content, which is unpatched by construction (idempotency
+# short-circuits before any write when already patched).
+sub make_backup {
+    my ( $file, $name ) = @_;
+    make_path( $BACKUP_DIR, {mode => oct('755')} ) unless -d $BACKUP_DIR;
+    my $bak = backup_path($name);
+    copy( $file, $bak ) or die "backup $file -> $bak: $!\n";
+    chmod oct('600'), $bak;
+    return $bak;
+}
+
+sub restore_backup {
+    my ( $file, $name ) = @_;
+    my $bak = backup_path($name);
+    return 0 unless -f $bak;
+    copy( $bak, $file ) or die "restore $bak -> $file: $!\n";
+    return 1;
+}
+
+# Atomic in-place replacement preserving the original mode.
+sub atomic_write {
+    my ( $file, $content ) = @_;
+    my @st   = stat($file);
+    my $mode = @st ? ( $st[2] & oct('7777') ) : oct('644');
+    my $dir  = dirname($file);
+    my ( $tfh, $tmp ) = tempfile( "pve-modkit.XXXXXX", DIR => $dir );
+    binmode $tfh;
+    print {$tfh} $content or die "write temp: $!\n";
+    close $tfh            or die "close temp: $!\n";
+    chmod $mode, $tmp;
+    rename( $tmp, $file ) or do { unlink $tmp; die "rename $tmp -> $file: $!\n"; };
+    return 1;
+}
+
+# ===========================================================================
+# subcommand: patch tpl
+# ===========================================================================
+# Template Toolkit renderability gate. Returns:
+#   1  = rendered cleanly (or a soft/undef-var/file TT error we tolerate)
+#   0  = a hard TT parse/structural error -> caller restores + refuses
+#  -1  = Template.pm unavailable -> gate skipped (non-fatal; e.g. dev host)
+sub tt_ok {
+    my ($file) = @_;
+    eval { require Template; 1 } or return -1;
+
+    my $tt = Template->new(
+        {
+            INTERPOLATE => 0,
+            ABSOLUTE    => 1,
+            RELATIVE    => 1,
+            STRICT      => 0,
+        }
+    );
+
+    my $stash = _PermissiveStash->new;
+    my $out   = '';
+    my $ok    = $tt->process( $file, $stash, \$out );
+    return 1 if $ok;
+
+    my $err                 = $tt->error;
+    my $type                = ref($err) ? $err->type : '';
+    my %benign_render_error = ( undef => 1, file => 1 );
+    return 1 if $type && $benign_render_error{$type};
+    print {*STDERR} "pve-modkit: TT render error: $err\n";
+    return 0;
+}
+
+# Locate </head> (case-insensitive, last occurrence) as a line index.
+sub find_head_end_line {
+    my ($lines_ref) = @_;
+    my $target;
+    for my $i ( 0 .. $#{$lines_ref} ) {
+        $target = $i if $lines_ref->[$i] =~ m{</head\s*>}i;
+    }
+    return $target;
+}
+
+sub tpl_compute_apply {
+    my ($text) = @_;
+    return ( undef, 'already-patched' ) if index( $text, $TPL_MARKER ) >= 0;
+
+    my @lines  = split /^/, $text;
+    my $target = find_head_end_line( \@lines );
+    die "ERROR: </head> not found in target\n" unless defined $target;
+
+    my ($indent) = ( $lines[$target] =~ /^(\s*)/ );
+    $indent //= '';
+    splice( @lines, $target, 0, "$indent$TPL_TAG\n" );
+    my $out = join '', @lines;
+    return ( $out, "patched (before </head> at line " . ( $target + 1 ) . ")" );
+}
+
+sub tpl_compute_remove {
+    my ($text) = @_;
+    return ( undef, 'not-present' ) if index( $text, $TPL_MARKER ) < 0;
+    my @lines = split /^/, $text;
+    @lines = grep { index( $_, $TPL_MARKER ) < 0 } @lines;
+    return ( join( '', @lines ), 'removed' );
+}
+
+# Returns 1 if a genuine write happened, else 0. Never exits 10 (a template
+# change only needs a pveproxy reload).
+sub cmd_patch_tpl {
+    my ( $file, $remove ) = @_;
+    $file //= $TPL_DEFAULT;
+
+    unless ( -f $file ) {
+        print {*STDERR} "pve-modkit: tpl target not found, skipping: $file\n";
+        return 0;
+    }
+
+    my $text = slurp($file);
+    my ( $new, $label ) =
+        $remove ? tpl_compute_remove($text) : tpl_compute_apply($text);
+
+    unless ( defined $new )  { print "pve-modkit: tpl $label\n";    return 0; }
+    if     ( $new eq $text ) { print "pve-modkit: tpl no change\n"; return 0; }
+
+    make_backup( $file, $TPL_BACKUP );
+    atomic_write( $file, $new );
+
+    my $gate = tt_ok($file);
+    if ( $gate == 0 ) {
+        my $restored = restore_backup( $file, $TPL_BACKUP );
+        die "ERROR: post-patch Template render failed; "
+            . ( $restored ? "restored original from backup" : "NO backup to restore" )
+            . "; refusing to proceed\n";
+    } elsif ( $gate == -1 ) {
+        print {*STDERR} "pve-modkit: Template.pm unavailable; skipped render gate\n";
+    }
+
+    print "pve-modkit: tpl $label\n";
+    return 1;
+}
+
+# ===========================================================================
+# subcommand: patch pveproxy
+# ===========================================================================
+sub perl_c_ok {
+    my ($file) = @_;
+    my $rc = system( 'perl', '-c', $file );
+    return ( $rc == 0 ) ? 1 : 0;
+}
+
+# PPI structural analysis of $text. Returns (have_anchor, have_marker).
+sub pp_analyze {
+    my ($text) = @_;
+    require PPI;
+    my $doc = PPI::Document->new( \$text )
+        or die "ERROR: PPI parse failed on target\n";
+    my $statements = $doc->find('PPI::Statement') || [];
+    my ( $anchor, $marker ) = ( 0, 0 );
+    for my $st ( @{$statements} ) {
+        my $c = $st->content;
+        $anchor = 1 if $c =~ /add_dirs/ && $c =~ m{/pve2/js/} && $c =~ /\$dirs/;
+        $marker = 1 if $c =~ /add_dirs/ && $c =~ /\Q$PP_MARKER\E/;
+    }
+    return ( $anchor, $marker );
+}
+
+sub pp_reparse_ok {
+    my ($text) = @_;
+    require PPI;
+    return PPI::Document->new( \$text ) ? 1 : 0;
+}
+
+sub pp_compute_apply {
+    my ($text) = @_;
+    my ( $have_anchor, $have_marker ) = pp_analyze($text);
+    die "ERROR: anchor add_dirs('/pve2/js/') not found in target\n"
+        unless $have_anchor;
+    return ( undef, 'already-patched' ) if $have_marker;
+
+    my @lines = split /^/, $text;
+    my $target;
+    for my $i ( 0 .. $#lines ) {
+        if ( $lines[$i] =~ /add_dirs/ && $lines[$i] =~ m{'/pve2/js/'} ) {
+            $target = $i;
+            last;
+        }
+    }
+    die "ERROR: physical anchor line not found\n" unless defined $target;
+    splice( @lines, $target + 1, 0, $PP_NEWLINE );
+    my $out = join '', @lines;
+    pp_reparse_ok($out) or die "ERROR: post-edit PPI reparse failed\n";
+    return ( $out, "patched (anchor line " . ( $target + 1 ) . ")" );
+}
+
+sub pp_compute_remove {
+    my ($text) = @_;
+    my ( undef, $have_marker ) = pp_analyze($text);
+    return ( undef, 'not-present' ) unless $have_marker;
+
+    my @lines = split /^/, $text;
+    @lines = grep { !( /add_dirs/ && /\Q$PP_MARKER\E/ ) } @lines;
+    my $out = join '', @lines;
+    pp_reparse_ok($out) or die "ERROR: post-edit PPI reparse failed\n";
+    return ( $out, 'removed' );
+}
+
+# Returns 1 if a genuine write happened (caller must FULLY RESTART pveproxy),
+# else 0.
+sub cmd_patch_pveproxy {
+    my ( $file, $remove ) = @_;
+    $file //= $PVEPROXY_DEFAULT;
+
+    unless ( -f $file ) {
+        print {*STDERR} "pve-modkit: pveproxy target not found, skipping: $file\n";
+        return 0;
+    }
+
+    my $text = slurp($file);
+    my ( $new, $label ) =
+        $remove ? pp_compute_remove($text) : pp_compute_apply($text);
+
+    unless ( defined $new )  { print "pve-modkit: pveproxy $label\n";    return 0; }
+    if     ( $new eq $text ) { print "pve-modkit: pveproxy no change\n"; return 0; }
+
+    make_backup( $file, $PP_BACKUP );
+    atomic_write( $file, $new );
+
+    unless ( perl_c_ok($file) ) {
+        my $restored = restore_backup( $file, $PP_BACKUP );
+        die "ERROR: post-patch 'perl -c' failed; "
+            . ( $restored ? "restored original from backup" : "NO backup to restore" )
+            . "; refusing to proceed\n";
+    }
+
+    print "pve-modkit: pveproxy $label\n";
+    return 1;
+}
+
+# ===========================================================================
+# mod.json model (lenient) + index / enable / disable
+# ===========================================================================
+
+# A mod directory name must be a simple, filesystem-safe token: it starts with
+# an alphanumeric and thereafter allows only alphanumerics, dot, underscore and
+# hyphen. This rejects slashes, whitespace and path/shell metacharacters before
+# the name is ever used to build a filesystem path or a /modkit/ URL.
+sub valid_mod_name {
+    my ($name) = @_;
+    return 0 unless defined $name && length $name;
+    return 0 if length($name) > $MOD_NAME_MAX;
+    return $name =~ /^[[:alnum:]][[:alnum:]._-]*\z/ ? 1 : 0;
+}
+
+# A mod.json "entry" is honored only if it stays inside the mod's own directory:
+# no absolute paths (leading slash) and no ".." components. Legitimate nested
+# entries such as "dist/index.js" remain allowed.
+sub entry_is_safe {
+    my ($entry) = @_;
+    return 0 if substr( $entry, 0, 1 ) eq '/';
+    for my $part ( split m{/}, $entry ) {
+        return 0 if $part eq '..';
+    }
+    return 1;
+}
+
+# Read + lenient-parse a single mod's mod.json. Returns a hashref:
+#   { name => <dir basename>, entry => <string>, enabled => 0|1, ok => 0|1 }
+# Lenient rules (user intent, m0464 Q3):
+#   * enabled: honored ONLY if present AND a real JSON boolean; otherwise
+#     (omitted / null / mistyped e.g. a string) -> treated as ENABLED.
+#   * entry:   honored ONLY if present AND a non-empty string; otherwise
+#     -> default "index.js".
+# A syntactically broken or unreadable mod.json is ISOLATED: we still return the
+# mod as enabled with the default entry (ok => 0), so one bad file never blanks
+# the whole manifest. (A mod dir with a usable entry file should still load.)
+sub read_mod {
+    my ( $mods_dir, $name ) = @_;
+    my $mj = "$mods_dir/$name/mod.json";
+
+    my %mod = ( name => $name, entry => $DEFAULT_ENTRY, enabled => 1, ok => 1 );
+
+    unless ( -f $mj ) {
+        # No mod.json at all -> lenient defaults (enabled, index.js).
+        return \%mod;
+    }
+
+    my $raw = eval { slurp($mj) };
+    if ( !defined $raw ) {
+        print {*STDERR} "pve-modkit: cannot read $mj: $@";
+        $mod{ok} = 0;
+        return \%mod;
+    }
+
+    require JSON::PP;
+    my $data = eval { JSON::PP->new->utf8->decode($raw) };
+    if ( !$data || ref($data) ne 'HASH' ) {
+        # Malformed JSON or non-object: isolate the failure, keep defaults.
+        print {*STDERR} "pve-modkit: malformed mod.json for '$name'"
+            . ( $@ ? ": $@" : "" )
+            . "; using lenient defaults\n";
+        $mod{ok} = 0;
+        return \%mod;
+    }
+
+    # entry: only a non-empty string overrides the default, and only if it is a
+    # path that stays within the mod's own directory (no absolute path, no ".."
+    # traversal). An unsafe entry is rejected back to the default and flagged.
+    my $want = $data->{entry};
+    if ( defined $want && !ref($want) && length $want ) {
+        if ( entry_is_safe($want) ) {
+            $mod{entry} = $want;
+        } else {
+            print {*STDERR} "pve-modkit: mod '$name' entry '$want' is unsafe "
+                . "(absolute or contains '..'); using default '$DEFAULT_ENTRY'\n";
+            $mod{ok} = 0;
+        }
+    }
+
+    # enabled: only a real JSON boolean is honored. JSON::PP decodes booleans as
+    # JSON::PP::Boolean objects; anything else (string, number, null, absent)
+    # falls through to the enabled-by-default rule.
+    if ( exists $data->{enabled}
+        && ref( $data->{enabled} ) eq 'JSON::PP::Boolean' )
+    {
+        $mod{enabled} = $data->{enabled} ? 1 : 0;
+    }
+
+    return \%mod;
+}
+
+# Enumerate mod subdirectories under $mods_dir. A valid mod is a non-hidden
+# subdirectory whose name passes valid_mod_name(). Anything else is surfaced on
+# STDERR rather than silently ignored: the expected loader/manifest files
+# ($LOADER_FILE, $MANIFEST) stay quiet, but every other stray file, and every
+# subdirectory with an unusable name, is reported.
+sub list_mod_dirs {
+    my ($mods_dir) = @_;
+    opendir( my $dh, $mods_dir ) or return ();
+    my %known = ( $LOADER_FILE => 1, $MANIFEST => 1 );
+    my @dirs;
+    while ( defined( my $e = readdir($dh) ) ) {
+        next if $e eq '.' || $e eq '..';
+        next if substr( $e, 0, 1 ) eq '.';
+        my $is_dir = -d "$mods_dir/$e";
+        if ( $is_dir && valid_mod_name($e) ) {
+            push @dirs, $e;
+            next;
+        }
+        next if !$is_dir && $known{$e};
+        my $kind = $is_dir ? 'directory'        : 'file';
+        my $why  = $is_dir ? 'invalid mod name' : 'not a mod directory';
+        print {*STDERR} "pve-modkit: ignoring stray $kind '$e' in mods dir ($why)\n";
+    }
+    closedir($dh);
+    my @sorted = sort @dirs;
+    return @sorted;
+}
+
+# Build the manifest JSON string from the enabled mods. Shape:
+#   { "mods": [ { "name": "...", "path": "{mod}/{entry}" }, ... ] }
+sub build_manifest_json {
+    my (@entries) = @_;    # list of [name, path]
+    require JSON::PP;
+    my $obj = {mods => [ map { {name => $_->[0], path => $_->[1]} } @entries ]};
+    # canonical + pretty so the loop-guard comparison is stable across runs.
+    return JSON::PP->new->utf8->canonical->pretty->encode($obj);
+}
+
+# index: regenerate the top-level manifest listing only enabled mods.
+# Loop-guarded (only writes when content changes). Returns 0.
+sub cmd_index {
+    my ($mods_dir) = @_;
+    $mods_dir //= $MODS_DIR;
+
+    unless ( -d $mods_dir ) {
+        print {*STDERR} "pve-modkit: mods dir '$mods_dir' does not exist; nothing to do\n";
+        return 0;
+    }
+
+    my @entries;
+    for my $name ( list_mod_dirs($mods_dir) ) {
+        my $mod = read_mod( $mods_dir, $name );
+        next unless $mod->{enabled};
+        # entry file must actually exist to be worth listing.
+        my $entry = $mod->{entry};
+        unless ( -f "$mods_dir/$name/$entry" ) {
+            print {*STDERR} "pve-modkit: mod '$name' entry '$entry' missing; skipping\n";
+            next;
+        }
+        push @entries, [ $name, "$name/$entry" ];
+    }
+
+    my $json = build_manifest_json(@entries);
+    my $path = "$mods_dir/$MANIFEST";
+
+    my $current;
+    if ( open( my $rfh, '<', $path ) ) {
+        local $/ = undef;
+        $current = <$rfh>;
+        close $rfh or warn "pve-modkit: close $path: $!\n";
+    }
+    if ( defined($current) && $current eq $json ) {
+        print "pve-modkit: index unchanged (" . scalar(@entries) . " mod(s))\n";
+        return 0;
+    }
+
+    atomic_write_new( $path, $json );
+    print "pve-modkit: index wrote " . scalar(@entries) . " mod(s) -> $path\n";
+    return 0;
+}
+
+# Like atomic_write but for a path that may not yet exist (new manifest).
+sub atomic_write_new {
+    my ( $path, $content ) = @_;
+    my $dir = dirname($path);
+    my ( $tfh, $tmp ) = tempfile( "pve-modkit.XXXXXX", DIR => $dir );
+    binmode $tfh;
+    print {$tfh} $content or die "write temp: $!\n";
+    close $tfh            or die "close temp: $!\n";
+    chmod 0644, $tmp;
+    rename( $tmp, $path ) or do { unlink $tmp; die "rename $tmp -> $path: $!\n"; };
+    return 1;
+}
+
+# Set enabled=<bool> in a single mod's mod.json, creating it if absent.
+# Preserves other fields. Returns (changed, was_present_before).
+sub set_mod_enabled {
+    my ( $mods_dir, $name, $want ) = @_;
+    my $moddir = "$mods_dir/$name";
+    die "ERROR: no such mod directory: $moddir\n" unless -d $moddir;
+
+    my $mj = "$moddir/mod.json";
+    require JSON::PP;
+    my $data = {};
+    if ( -f $mj ) {
+        my $raw = eval { slurp($mj) };
+        if ( defined $raw ) {
+            my $parsed = eval { JSON::PP->new->utf8->decode($raw) };
+            $data = $parsed if $parsed && ref($parsed) eq 'HASH';
+        }
+    }
+    $data->{name}  //= $name;
+    $data->{entry} //= $DEFAULT_ENTRY;
+    $data->{enabled} = $want ? JSON::PP::true() : JSON::PP::false();
+
+    my $json = JSON::PP->new->utf8->canonical->pretty->encode($data);    ## no critic (ValuesAndExpressions::ProhibitLongChainsOfMethodCalls)
+    atomic_write_new( $mj, $json );
+    return 1;
+}
+
+sub cmd_enable_disable {
+    my ( $want, $mods_dir, @names ) = @_;
+    $mods_dir //= $MODS_DIR;
+    die "ERROR: no mod name given\n" unless @names;
+
+    for my $name (@names) {
+        set_mod_enabled( $mods_dir, $name, $want );
+        print "pve-modkit: " . ( $want ? "enabled" : "disabled" ) . " '$name'\n";
+    }
+
+    # Regenerate the manifest to reflect the new enabled set.
+    cmd_index($mods_dir);
+
+    if ($want) {
+        print {*STDERR} "pve-modkit: NOTE: a newly-present mod directory is only "
+            . "served after a pveproxy restart (systemctl restart pveproxy).\n";
+    }
+    return 0;
+}
+
+# ===========================================================================
+# subcommand: sync (manifest + restart-on-route-change)
+# ===========================================================================
+# Restart pveproxy the way the maintainer scripts do: prefer deb-systemd-invoke
+# (respects policy-rc.d / the packaging environment), fall back to systemctl.
+# Best-effort: never dies (a failed restart must not wedge the watcher).
+sub restart_pveproxy {
+    return unless -d '/run/systemd/system';
+    if (
+        system(
+            'sh', '-c',
+            'command -v deb-systemd-invoke >/dev/null 2>&1'
+        ) == 0
+        )
+    {
+        system( 'deb-systemd-invoke', 'try-restart', 'pveproxy.service' );
+    } else {
+        system( 'systemctl', 'try-restart', 'pveproxy.service' );
+    }
+    return;
+}
+
+# Read the previously-recorded mod-subdir set (newline-separated). Missing state
+# (first run after boot/install) returns undef so the caller treats the current
+# set as "unknown baseline" and does NOT spuriously restart.
+sub read_dirstate {
+    my $path = "$STATE_DIR/$STATE_FILE";
+    return unless -f $path;
+    my $raw = eval { slurp($path) };
+    return unless defined $raw;
+    my %seen = map { $_ => 1 } grep { length } split /\n/, $raw;
+    return \%seen;
+}
+
+sub write_dirstate {
+    my (@names) = @_;
+    make_path( $STATE_DIR, {mode => oct('755')} ) unless -d $STATE_DIR;
+    my $path    = "$STATE_DIR/$STATE_FILE";
+    my $content = join( '', map { "$_\n" } sort @names );
+    # Atomic within /run; not loop-sensitive (outside the watched dir).
+    my ( $tfh, $tmp ) = tempfile( "moddirs.XXXXXX", DIR => $STATE_DIR );
+    print {$tfh} $content or warn "pve-modkit: write dirstate: $!\n";
+    close $tfh            or warn "pve-modkit: close dirstate: $!\n";
+    rename( $tmp, $path ) or do { unlink $tmp; die "write dirstate: $!\n"; };
+    return;
+}
+
+# sync: regenerate the manifest, then restart pveproxy iff the on-disk set of
+# mod subdirectories changed since last sync (install or removal). Returns 0.
+sub cmd_sync {
+    my ($mods_dir) = @_;
+    $mods_dir //= $MODS_DIR;
+
+    # Always refresh the manifest first (enabled-only, loop-guarded).
+    cmd_index($mods_dir);
+
+    my @now  = list_mod_dirs($mods_dir);
+    my %now  = map { $_ => 1 } @now;
+    my $prev = read_dirstate();
+
+    # Record the current set regardless, so the next sync compares against it.
+    write_dirstate(@now);
+
+    if ( !defined $prev ) {
+        # No baseline yet: either the first sync after install, or the first
+        # sync after a reboot (STATE_DIR lives on tmpfs and is wiped on boot).
+        # We cannot tell which mod subdirs pveproxy already registered at its
+        # own init, so we cannot prove every present mod is already routable.
+        # A brand-new mod subdir is only served after a full pveproxy restart
+        # (its File::Find dir walk only re-runs at init). To keep mod loading
+        # 100% automatic ("drop a folder in, refresh the browser, done") even
+        # across reboots, restart pveproxy whenever any mods are present so
+        # their /modkit/<mod>/ routes are guaranteed registered. try-restart
+        # is cheap and idempotent; with zero mods there is nothing to serve.
+        if (@now) {
+            print "pve-modkit: sync: no prior state; "
+                . scalar(@now)
+                . " mod dir(s) present -> restarting pveproxy to guarantee routes\n";
+            restart_pveproxy();
+        } else {
+            print "pve-modkit: sync: no prior state and no mods; "
+                . "nothing to serve, no restart\n";
+        }
+        return 0;
+    }
+
+    # Symmetric difference of the two subdir sets = added or removed mods.
+    my @added   = grep { !$prev->{$_} } @now;
+    my @removed = grep { !$now{$_} } keys %{$prev};
+
+    if ( @added || @removed ) {
+        print "pve-modkit: sync: mod set changed (added: "
+            . ( @added ? join( ',', sort @added ) : 'none' )
+            . "; removed: "
+            . ( @removed ? join( ',', sort @removed ) : 'none' )
+            . ") -> restarting pveproxy\n";
+        restart_pveproxy();
+    } else {
+        print "pve-modkit: sync: no mod add/remove; manifest refreshed, " . "no restart\n";
+    }
+    return 0;
+}
+
+# ===========================================================================
+# subcommand: list / status
+# ===========================================================================
+# Read the current on-disk manifest into a name->path lookup so `list` can show
+# which mods are actually being served right now (vs merely enabled on disk).
+sub read_manifest_names {
+    my ($mods_dir) = @_;
+    my %in_manifest;
+    my $path = "$mods_dir/$MANIFEST";
+    return \%in_manifest unless -f $path;
+    my $raw = eval { slurp($path) };
+    return \%in_manifest unless defined $raw;
+    require JSON::PP;
+    my $data = eval { JSON::PP->new->utf8->decode($raw) };
+    return \%in_manifest unless $data && ref($data) eq 'HASH';
+    my $mods = $data->{mods};
+    return \%in_manifest unless $mods && ref($mods) eq 'ARRAY';
+
+    for my $m ( @{$mods} ) {
+        next unless ref($m) eq 'HASH' && defined $m->{name};
+        $in_manifest{$m->{name}} = 1;
+    }
+    return \%in_manifest;
+}
+
+# Inspect installed mods and print a table of their state. Returns 0.
+sub cmd_list {
+    my ($mods_dir) = @_;
+    $mods_dir //= $MODS_DIR;
+
+    unless ( -d $mods_dir ) {
+        print {*STDERR} "pve-modkit: mods dir '$mods_dir' does not exist\n";
+        return 0;
+    }
+
+    my @names = list_mod_dirs($mods_dir);
+    unless (@names) {
+        print "No mods installed under $mods_dir\n";
+        return 0;
+    }
+
+    my $in_manifest = read_manifest_names($mods_dir);
+
+    # Column widths (STATE fits "disabled"; SERVED fits "served").
+    my $wname = 4;    # "NAME"
+    for my $n (@names) { $wname = length($n) if length($n) > $wname; }
+
+    printf "%-${wname}s  %-8s  %-6s  %s\n", 'NAME', 'STATE', 'SERVED', 'ENTRY';
+    for my $name (@names) {
+        my $mod       = read_mod( $mods_dir, $name );
+        my $entry     = $mod->{entry};
+        my $has_entry = -f "$mods_dir/$name/$entry";
+        my $state     = $mod->{enabled} ? 'enabled' : 'disabled';
+        # "served" = enabled AND entry present AND currently in the manifest.
+        my $served     = ( $mod->{enabled} && $has_entry && $in_manifest->{$name} ) ? 'yes' : 'no';
+        my $entry_disp = $entry;
+        $entry_disp .= ' (MISSING)'      if !$has_entry;
+        $entry_disp .= ' [bad mod.json]' if !$mod->{ok};
+        printf "%-${wname}s  %-8s  %-6s  %s\n",
+            $name, $state, $served, $entry_disp;
+    }
+    return 0;
+}
+
+# ===========================================================================
+# argument parsing helper: extract --opt VALUE / flags from a list
+# ===========================================================================
+sub take_opt {
+    my ( $argv, $optname ) = @_;    # mutates @$argv, returns value or undef
+    for my $i ( 0 .. $#{$argv} ) {
+        if ( $argv->[$i] eq $optname ) {
+            my $val = $argv->[ $i + 1 ];
+            die "ERROR: $optname requires a value\n" unless defined $val;
+            splice( @{$argv}, $i, 2 );
+            return $val;
+        }
+    }
+    return;
+}
+
+sub take_flag {
+    my ( $argv, $flagname ) = @_;    # mutates @$argv, returns 1 if present
+    for my $i ( 0 .. $#{$argv} ) {
+        if ( $argv->[$i] eq $flagname ) { splice( @{$argv}, $i, 1 ); return 1; }
+    }
+    return 0;
+}
+
+# ===========================================================================
+# usage
+# ===========================================================================
+sub usage {
+    print <<"EOF";
+pve-modkit - Proxmox VE web UI mod kit CLI
+
+Usage:
+  pve-modkit patch tpl [--file PATH] [--remove]
+  pve-modkit patch pveproxy [--file PATH] [--remove]
+  pve-modkit index [--dir DIR]
+  pve-modkit sync [--dir DIR]
+  pve-modkit list [--dir DIR]
+  pve-modkit enable  <mod> [<mod> ...]
+  pve-modkit disable <mod> [<mod> ...]
+  pve-modkit unpatch [--file-tpl PATH] [--file-pveproxy PATH]
+  pve-modkit help
+
+Exit codes:
+  0   success / no change needed
+  10  a genuine pveproxy.pm dir-key change happened -> caller must RESTART
+      pveproxy (a reload will not register/unregister the /modkit/ dir key)
+EOF
+    exit 0;
+}
+
+# ===========================================================================
+# main dispatch
+# ===========================================================================
+my @argv = @ARGV;
+my $cmd  = shift @argv;
+$cmd //= '';
+
+## no critic (ControlStructures::ProhibitCascadingIfElse)
+if ( $cmd eq 'help' || $cmd eq '--help' || $cmd eq '-h' || $cmd eq '' ) {
+    usage();
+} elsif ( $cmd eq 'patch' ) {
+    my $what = shift @argv;
+    $what //= '';
+    if ( $what eq 'tpl' ) {
+        my $remove = take_flag( \@argv, '--remove' );
+        my $file   = take_opt( \@argv, '--file' );
+        die "ERROR: unexpected args: @argv\n" if @argv;
+        cmd_patch_tpl( $file, $remove );
+        exit 0;
+    } elsif ( $what eq 'pveproxy' ) {
+        my $remove = take_flag( \@argv, '--remove' );
+        my $file   = take_opt( \@argv, '--file' );
+        die "ERROR: unexpected args: @argv\n" if @argv;
+        my $wrote = cmd_patch_pveproxy( $file, $remove );
+        exit( $wrote ? 10 : 0 );
+    } else {
+        die "ERROR: unknown patch target '$what' (expected tpl|pveproxy)\n";
+    }
+} elsif ( $cmd eq 'index' ) {
+    my $dir = take_opt( \@argv, '--dir' );
+    die "ERROR: unexpected args: @argv\n" if @argv;
+    cmd_index($dir);
+    exit 0;
+} elsif ( $cmd eq 'sync' ) {
+    my $dir = take_opt( \@argv, '--dir' );
+    die "ERROR: unexpected args: @argv\n" if @argv;
+    cmd_sync($dir);
+    exit 0;
+} elsif ( $cmd eq 'list' || $cmd eq 'status' ) {
+    my $dir = take_opt( \@argv, '--dir' );
+    die "ERROR: unexpected args: @argv\n" if @argv;
+    cmd_list($dir);
+    exit 0;
+} elsif ( $cmd eq 'enable' ) {
+    my $dir = take_opt( \@argv, '--dir' );
+    cmd_enable_disable( 1, $dir, @argv );
+    exit 0;
+} elsif ( $cmd eq 'disable' ) {
+    my $dir = take_opt( \@argv, '--dir' );
+    cmd_enable_disable( 0, $dir, @argv );
+    exit 0;
+} elsif ( $cmd eq 'unpatch' ) {
+    my $ftpl = take_opt( \@argv, '--file-tpl' );
+    my $fpp  = take_opt( \@argv, '--file-pveproxy' );
+    die "ERROR: unexpected args: @argv\n" if @argv;
+    cmd_patch_tpl( $ftpl, 1 );
+    my $wrote = cmd_patch_pveproxy( $fpp, 1 );
+    exit( $wrote ? 10 : 0 );
+} else {
+    die "ERROR: unknown subcommand '$cmd' (try: pve-modkit help)\n";
+}
+
+# ===========================================================================
+# _PermissiveStash: a Template Toolkit stash where every variable access
+# resolves to an empty string, so the renderability gate tests TEMPLATE
+# STRUCTURE, not the availability of PVE's real runtime data.
+# ===========================================================================
+package _PermissiveStash;
+
+sub new { return bless {}, shift }
+sub get { return '' }
+sub set { return '' }                ## no critic (NamingConventions::ProhibitAmbiguousNames)
+
+sub getref {
+    return sub { '' }
+}
+sub update  { return }
+sub clone   { my ($self) = @_; return $self; }
+sub declone { my ($self) = @_; return $self; }

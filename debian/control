@@ -1,0 +1,30 @@
+Source: pve-modkit
+Section: admin
+Priority: optional
+Maintainer: Mark S. <the@wondersmith.dev>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+
+Package: pve-modkit
+Architecture: all
+Depends: ${misc:Depends},
+         ${perl:Depends},
+         libtemplate-perl,
+         libppi-perl,
+         pve-manager
+Description: mod loader / plugin framework for the Proxmox VE web UI
+ pve-modkit is a mod loader (plugin framework) for the Proxmox VE web
+ interface, not a single theme. It injects a small loader script into the PVE
+ UI and serves author-provided "mods" -- self-contained folders of JavaScript
+ and assets -- from /usr/share/pve-modkit/mods/ via a dedicated /modkit/ static
+ route registered in pveproxy. Many mods (themes, badges, tweaks, userscripts)
+ can be installed side by side; dropping a mod folder in makes it load
+ automatically on the next page load.
+ .
+ The web-UI patches (index.html.tpl and pveproxy.pm) are applied idempotently,
+ validated by the real Template Toolkit and Perl parsers, backed up
+ byte-for-byte, re-applied on upgrade via dpkg triggers, and cleanly reverted
+ on removal -- so you never hand-hack stock pve-manager files. Ships one subtle
+ default mod (a "modkit: active" badge beside the version header) to confirm
+ the loader is live; fuller demo mods live in the source tree and are not
+ installed.

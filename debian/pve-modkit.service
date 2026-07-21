@@ -1,0 +1,9 @@
+[Unit]
+Description=pve-modkit: synchronize installed/enabled mod state with the PVE-owned pveproxy process
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/pve-modkit/bin/pve-modkit sync
+
+# Intentionally NO [Install] section: this oneshot must never be enabled on
+# its own. It is triggered exclusively by pve-modkit.path.

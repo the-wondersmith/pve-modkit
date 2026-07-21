@@ -1,0 +1,40 @@
+---
+name: prepare-ci-env
+description: Prepare CI Environment
+
+inputs:
+  cache-only:
+    required: false
+    default: "false"
+    description: If `true`, skip pulling the caches, but create the missing cache entries
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      id: install_python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.14'
+
+    - name: Install `mise`
+      id: install_mise
+      uses: jdx/mise-action@v3
+      with:
+        env: false  # Do not load the environment section from `mise.toml` into GITHUB_ENV
+        install: true
+
+    - name: Cache pre-commit hooks
+      id: cache_pre_commit
+      uses: actions/cache@v4
+      with:
+        lookup-only: ${{ inputs.cache-only == 'true' }}
+        path: ~/.cache/pre-commit
+        key: >-
+          pre-commit-3-py${{ steps.install_python.outputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+    - name: Force reinstall pre-commit hooks on cache miss
+      if: ${{ steps.cache_pre_commit.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: |
+        pre-commit install-hooks --color=always

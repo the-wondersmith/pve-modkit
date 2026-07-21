@@ -1,0 +1,37 @@
+#!/bin/sh
+# pve-modkit prerm: on genuine removal (not upgrade) restore the template and
+# stop the watcher. During an upgrade we deliberately leave the patch in place
+# so the UI never briefly loses the loader tag.
+set -e
+
+MODKIT_CLI=/usr/libexec/pve-modkit/bin/pve-modkit
+
+case "$1" in
+  remove | deconfigure)
+    # Restore the Proxmox index template to its unpatched state.
+    if [ -x "${MODKIT_CLI}" ]; then
+      "${MODKIT_CLI}" patch tpl --remove || true
+    fi
+
+    # Restore pveproxy.pm (remove the /modkit/ dir key).
+    if [ -x "${MODKIT_CLI}" ]; then
+      "${MODKIT_CLI}" patch pveproxy --remove || true
+    fi
+
+    # Stop the author-dir watcher (the debhelper-generated section below
+    # handles disable; this just stops it promptly).
+    if [ -d /run/systemd/system ]; then
+      deb-systemd-invoke stop pve-modkit.path || true
+    fi
+    ;;
+
+  upgrade)
+    # Do not unpatch on upgrade.
+    :
+    ;;
+
+esac
+
+#DEBHELPER#
+
+exit 0

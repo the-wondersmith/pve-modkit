@@ -1,0 +1,128 @@
+---
+name: pve-modkit CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request: {}
+
+env:
+  MISE_ENV: ci
+
+# ADHD mitigation: cancel the running/pending workflows if a new change
+# has been pushed to the same PR or feature branch.
+# Workflows for the main branch and for the tags will always be queued.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # yamllint disable-line rule:line-length
+  cancel-in-progress: ${{ ! (startsWith(github.ref, 'refs/tags/') || (github.ref_name == github.event.repository.default_branch)) }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Prepare CI Environment
+        uses: ./.github/actions/prepare-ci-env
+
+      - name: Run `pre-commit`
+        shell: bash
+        run: |
+          pre-commit run --show-diff-on-failure --color=always --all-files
+
+      - name: Lint
+        run: mise run lint
+
+      - name: Test
+        run: mise run tests
+
+  build:
+    name: Build .deb
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Debian packaging toolchain
+        shell: bash
+        run: |
+          sudo apt update
+          sudo apt install -y --no-install-recommends \
+            dpkg-dev debhelper libppi-perl libtemplate-perl
+
+      - name: Prepare CI Environment
+        uses: ./.github/actions/prepare-ci-env
+
+      - name: Build package
+        shell: bash
+        # CI=true is set by GitHub Actions, so `mise run build` takes its
+        # native dpkg-buildpackage path (no docker) on this Debian runner.
+        run: mise run build
+
+      - name: Verify package contents
+        shell: bash
+        run: |
+          debs=(dist/pve-modkit_*_all.deb)
+          deb="${debs[0]}"
+          echo "Built: ${deb}"
+          dpkg-deb -c "${deb}"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pve-modkit-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download .deb artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: pve-modkit-deb
+          path: dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.deb
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      # A Release created by the default GITHUB_TOKEN does NOT fire the
+      # `release: published` event (GitHub anti-recursion rule), so the
+      # planted publish-apt-packages.yaml won't run on this CI path. Dispatch
+      # to the APT control plane directly here instead. `repository_dispatch`
+      # is exempt from the anti-recursion rule and always fires. The planted
+      # workflow still covers manual (GitHub UI) releases, which use the
+      # user's token and do fire `release: published`; ingest is idempotent
+      # on (repo, tag), so a rare double-dispatch is harmless.
+      - name: Notify APT control plane
+        env:
+          GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+        run: |
+          jq -n \
+            --arg tag "${{ github.ref_name }}" \
+            --arg repo "${{ github.repository }}" \
+            '{event_type: "publish-deb", client_payload: {tag: $tag, repo: $repo}}' \
+          | gh api -X POST /repos/the-wondersmith/apt/dispatches --input -

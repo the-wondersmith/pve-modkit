@@ -1,0 +1,86 @@
+---
+minimum_pre_commit_version: "4.0.0"
+default_stages:
+  - pre-commit
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    # pragma: allowlist nextline secret
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: check-case-conflict
+      - id: check-json
+      - id: check-yaml
+        args:
+          - --allow-multiple-documents
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: check-added-large-files
+      - id: check-merge-conflict
+
+  - repo: https://github.com/Yelp/detect-secrets
+    # pragma: allowlist nextline secret
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args:
+          - --baseline
+          - .secrets.baseline
+          # https://github.com/Yelp/detect-secrets/issues/435#issuecomment-3335519354
+          - --exclude-lines
+          - ^\s*rev:\s*(.+)\s*#\s*frozen:\s*(.+)$
+        exclude: .*\.lock$|.*-lock\.json$|^.secrets.baseline$
+
+  - repo: https://github.com/jumanjihouse/pre-commit-hooks
+    # pragma: allowlist nextline secret
+    rev: 3.0.0
+    hooks:
+      - id: shellcheck
+      - id: shfmt
+        args:
+          - -i 2 -ci -bn -sr
+
+  - repo: https://github.com/editorconfig-checker/editorconfig-checker.python
+    # pragma: allowlist nextline secret
+    rev: 3.6.1
+    hooks:
+      - id: editorconfig-checker
+        alias: ec
+
+  - repo: https://github.com/adrienverge/yamllint
+    # pragma: allowlist nextline secret
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+        args:
+          - --config-file
+          - .yamllint.yaml
+
+  - repo: https://github.com/rhysd/actionlint
+    # pragma: allowlist nextline secret
+    rev: v1.7.12
+    hooks:
+      - id: actionlint-system
+
+  # Local (system) hooks. These lint tools are provisioned by mise
+  # (perlcritic/perltidy via mise-perl + cpanm; eslint via npm devDependencies),
+  # so they run against the mise-managed toolchain rather than a pinned pre-commit
+  # environment.
+  - repo: local
+    hooks:
+      - id: perlcritic
+        name: Perl::Critic
+        entry: mise exec -- perlcritic
+        language: system
+        files: ^src/bin/pve-modkit$|\.p[lm]$
+      - id: perltidy
+        name: Perl::Tidy (check)
+        entry: mise exec -- perltidy --assert-tidy -o /dev/null
+        language: system
+        files: ^src/bin/pve-modkit$|\.p[lm]$
+      - id: eslint
+        name: ESLint
+        entry: npx eslint
+        language: system
+        files: \.js$
+        exclude: ^node_modules/

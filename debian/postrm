@@ -1,0 +1,47 @@
+#!/bin/sh
+# pve-modkit postrm: clean up the runtime-generated manifest on removal and the
+# whole pve-modkit tree on purge. index.json in the mods dir is produced by
+# `pve-modkit index` at runtime (not packaged), so we remove it ourselves here.
+set -e
+
+MODKIT_DIR=/usr/share/pve-modkit
+MANIFEST=/usr/share/pve-modkit/mods/index.json
+
+reload_pveproxy() {
+  if [ -d /run/systemd/system ]; then
+    deb-systemd-invoke reload-or-try-restart pveproxy.service || true
+  fi
+}
+
+case "$1" in
+  remove)
+    if [ -f "${MANIFEST}" ]; then
+      rm -f "${MANIFEST}" || true
+    fi
+
+    reload_pveproxy
+    ;;
+
+  purge)
+    if [ -d "${MODKIT_DIR}" ]; then
+      rm -rf "${MODKIT_DIR}" || true
+    fi
+
+    if command -v deb-systemd-helper > /dev/null 2>&1; then
+      deb-systemd-helper purge pve-modkit.path || true
+      deb-systemd-helper purge pve-modkit.service || true
+    fi
+
+    reload_pveproxy
+    ;;
+
+  upgrade | failed-upgrade | abort-install | abort-upgrade | disappear)
+    # Nothing destructive on these transitions.
+    :
+    ;;
+
+esac
+
+#DEBHELPER#
+
+exit 0

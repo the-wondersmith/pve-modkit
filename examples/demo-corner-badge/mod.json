@@ -1,0 +1,7 @@
+{
+  "name": "demo-corner-badge",
+  "version": "1.0.0",
+  "description": "Demo mod: a small floating corner badge announcing the UI is modded with pve-modkit.",
+  "entry": "index.js",
+  "enabled": true
+}

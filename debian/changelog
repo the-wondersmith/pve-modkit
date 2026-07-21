@@ -1,0 +1,27 @@
+pve-modkit (0.1.0) trixie; urgency=low
+
+  * Initial release.
+    - Unified `pve-modkit` Perl CLI (subcommands: patch tpl, patch pveproxy,
+      index, sync, enable, disable, list/status, unpatch, help).
+    - Template patch: idempotent injection of the modkit loader <script> into
+      /usr/share/pve-manager/index.html.tpl. Spliced textually and gated by a
+      Template Toolkit render check (the template is not valid HTML), with
+      backup + restore-on-failure and --remove.
+    - pveproxy patch: registers the /modkit/ static dir key in
+      PVE/Service/pveproxy.pm via a PPI-located anchor, gated by `perl -c`,
+      with backup + restore-on-failure. Exit 10 signals the maintainer scripts
+      to fully restart pveproxy (a reload will not rebuild its $dirs table).
+    - Mods are self-contained dirs under /usr/share/pve-modkit/mods/ served at
+      /modkit/{mod}/{entry}; the loader (ext.js) fetches the enabled-only
+      /modkit/index.json manifest and injects each mod on page load.
+    - systemd pve-modkit.path watcher runs `pve-modkit sync` on mod add/remove,
+      regenerating the manifest and restarting pveproxy only when the served
+      route set changed.
+    - dpkg triggers (interest-noawait /usr/share/pve-manager and
+      /usr/share/perl5/PVE) re-apply both idempotent patches on pve-manager /
+      PVE upgrades.
+    - Ships one subtle default mod (modkit-active-badge): a "modkit: active"
+      badge beside the PVE version header. Fuller demo mods live in the source
+      tree under examples/ and are not installed.
+
+ -- Mark S. <the@wondersmith.dev>  Fri, 17 Jul 2026 21:52:44 -0400

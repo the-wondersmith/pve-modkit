@@ -1,0 +1,57 @@
+# Perl::Critic configuration for pve-modkit.
+#
+# Engine: severity 1 ("brutal") -- every policy is on by default. We then
+# exclude a small, documented set of brutal-only *stylistic* policies that
+# fight deliberate, readable idioms in a single-file, portable system CLI.
+# Everything else (all correctness policies, and all of severity 3-5) is
+# enforced and must be fixed in the code, not silenced here.
+
+severity = 1
+verbose  = %f:%l:%c %m [%p] (severity %s)\n
+
+# --- Documented policy exclusions (brutal-only style; each justified) --------
+
+# Postfix `if`/`unless`/`for` are idiomatic and read cleanly as guard clauses.
+[-ControlStructures::ProhibitPostfixControls]
+
+# `unless (...) { ... }` blocks are clearer than negated `if` for short guards.
+[-ControlStructures::ProhibitUnlessBlocks]
+
+# Explicit parentheses on builtins (join(), split(), keys()) aid readability.
+[-CodeLayout::ProhibitParensWithBuiltins]
+
+# Single-quoting string literals that contain no metacharacters is fine and
+# is not worth rewriting throughout; double quotes here are intentional.
+[-ValuesAndExpressions::ProhibitInterpolationOfLiterals]
+
+# Empty string literals `''` are the clearest way to express "no value".
+[-ValuesAndExpressions::ProhibitEmptyQuotes]
+
+# `q{}`/`qq{}` "noisy quote" preference is pure style; normal quotes are clearer.
+[-ValuesAndExpressions::ProhibitNoisyQuotes]
+
+# Punctuation vars ($/, $!, $@, $0, $#) are unavoidable and idiomatic in a
+# system-level CLI that does slurping, error handling, and arg parsing.
+[-Variables::ProhibitPunctuationVars]
+
+# Exit codes and Unix mode bits are self-evident constants in this program;
+# forcing Readonly wrappers around them hurts, not helps, readability.
+[-ValuesAndExpressions::ProhibitMagicNumbers]
+
+# Forcing /x, /m, /s onto short, anchored regexes reduces clarity here.
+[-RegularExpressions::RequireExtendedFormatting]
+[-RegularExpressions::RequireLineBoundaryMatching]
+[-RegularExpressions::RequireDotMatchAnything]
+
+# The top-level "main dispatch" is an inherently branchy CLI argument router.
+# A single, flat if/elsif chain over the subcommand name is clearer and easier
+# to audit than an indirection/dispatch table, and this policy is document-scoped
+# (reported at line 1) so it cannot be silenced with an inline `## no critic`.
+[-Modules::ProhibitExcessMainComplexity]
+
+# --- Tuned (not disabled) policies -------------------------------------------
+
+# Only require return-value checks on open/close (the ones that matter here).
+# Requiring a checked call on every print/say to STDERR/STDOUT is noise.
+[InputOutput::RequireCheckedSyscalls]
+functions = open close

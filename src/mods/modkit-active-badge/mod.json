@@ -1,0 +1,7 @@
+{
+    "name": "modkit-active-badge",
+    "version": "1.0.0",
+    "description": "Shows a subtle 'modkit: active' badge beside the PVE version header to confirm pve-modkit is installed and running.",
+    "entry": "index.js",
+    "enabled": true
+}

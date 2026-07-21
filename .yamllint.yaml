@@ -1,0 +1,24 @@
+---
+extends: default
+
+yaml-files:
+  - "*.yml"
+  - "*.yaml"
+
+# Only lint repo-authored YAML; never descend into dependencies or build output.
+ignore: |
+  dist/
+  .local/
+  .build-tmp/
+  node_modules/
+
+rules:
+  # GitHub Actions workflows use `on:` as a mapping key, which yamllint would
+  # otherwise flag as a truthy value. Skip key checks; still check values.
+  truthy:
+    check-keys: false
+
+  # Align with editorconfig
+  line-length:
+    max: 120
+    level: warning

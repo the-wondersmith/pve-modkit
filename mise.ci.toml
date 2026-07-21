@@ -1,0 +1,12 @@
+# Some of the tools are not needed in CI, so we include only the required tools here.
+
+[settings]
+enable_tools = [
+  "actionlint",
+  "editorconfig-checker",
+  "pre-commit",
+  "shellcheck",
+  "shfmt",
+  "yamllint",
+  "perl",
+]

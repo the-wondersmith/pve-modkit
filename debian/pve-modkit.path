@@ -1,0 +1,9 @@
+[Unit]
+Description=pve-modkit: sync installed/enabled mod state into the PVE-owned pveproxy
+
+[Path]
+PathModified=/usr/share/pve-modkit/mods
+Unit=pve-modkit.service
+
+[Install]
+WantedBy=multi-user.target

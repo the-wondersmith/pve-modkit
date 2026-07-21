@@ -1,0 +1,99 @@
+#!/bin/sh
+# pve-modkit postinst: patch the Proxmox index template, register the /modkit/
+# static dir key in pveproxy.pm, regenerate the mods manifest, and enable the
+# author-dir watcher. Idempotent and safe to run repeatedly (also invoked via
+# the dpkg triggers on /usr/share/pve-manager and /usr/share/perl5/PVE whenever
+# pve-manager rewrites those files on upgrade).
+set -e
+
+MODKIT_CLI=/usr/libexec/pve-modkit/bin/pve-modkit
+MODS_DIR=/usr/share/pve-modkit/mods
+
+# Set to 1 by apply_patches() when `pve-modkit patch pveproxy` reports it
+# actually added the /modkit/ dir key (exit 10). A plain reload does NOT rebuild
+# pveproxy's master $dirs table, so a NEW dir key only takes effect after a full
+# restart.
+NEED_PVEPROXY_RESTART=0
+
+apply_patches() {
+  # 1. Inject the loader tag into index.html.tpl (self-guards a missing
+  #    template, exits 0). Backs up + TT-validates + restores on failure.
+  if [ -x "${MODKIT_CLI}" ]; then
+    "${MODKIT_CLI}" patch tpl || true
+  fi
+  # 2. Register the /modkit/ dir key in pveproxy.pm so our mods tree is
+  #    reachable. Backs up + perl -c gates + restores on failure. Exit 10
+  #    means the dir key was newly written -> a full pveproxy restart is
+  #    required (reload is insufficient to register a new static dir key,
+  #    and the File::Find walk that registers each per-mod subdir only
+  #    re-runs on a full restart).
+  if [ -x "${MODKIT_CLI}" ]; then
+    set +e
+    "${MODKIT_CLI}" patch pveproxy
+    pveproxy_patch_rc=$?
+    set -e
+    if [ "${pveproxy_patch_rc}" -eq 10 ]; then
+      NEED_PVEPROXY_RESTART=1
+    fi
+  fi
+  # Never let this function's exit status trip the caller's `set -e`
+  # (e.g. when the -eq test above is false). apply_patches is best-effort.
+  return 0
+}
+
+# Activate the /modkit/ dir key with a full restart only when it was just
+# added; otherwise a plain reload is enough for template/mod-only changes.
+activate_dir_key() {
+  if [ "${NEED_PVEPROXY_RESTART}" -eq 1 ]; then
+    deb-systemd-invoke try-restart pveproxy.service || true
+  fi
+}
+
+# Reload pveproxy so a freshly injected loader tag / changed manifest is picked
+# up. `pve-modkit index` does NOT reload on its own, so postinst owns the
+# reload. (A brand-new dir key needs a full restart -- see activate_dir_key.)
+reload_pveproxy() {
+  if [ -d /run/systemd/system ]; then
+    deb-systemd-invoke reload-or-try-restart pveproxy.service || true
+  fi
+}
+
+case "$1" in
+  configure)
+    apply_patches
+    # Ensure the author source/served dir exists before generating the
+    # manifest.
+    mkdir -p "${MODS_DIR}"
+    # Regenerate the mods manifest (index.json) AND seed the sync baseline
+    # (the recorded set of mod folders under /run/pve-modkit) so the .path
+    # watcher can later tell a real mod add/remove apart from a file edit.
+    # On this first run there is no prior baseline, so `sync` issues no
+    # restart of its own; the /modkit/ route restart is handled by
+    # activate_dir_key below.
+    if [ -x "${MODKIT_CLI}" ]; then
+      "${MODKIT_CLI}" sync || true
+    fi
+    # Reload for the template patch + manifest; restart only if the
+    # /modkit/ dir key was freshly registered.
+    reload_pveproxy
+    activate_dir_key
+    ;;
+  triggered)
+    # Fired when /usr/share/pve-manager or /usr/share/perl5/PVE changes
+    # (e.g. a pve-manager upgrade clobbered our patches). Re-apply both
+    # patches and regenerate the manifest; restart pveproxy only if the
+    # dir key was re-added (upgrade may have reverted pveproxy.pm to
+    # pristine).
+    apply_patches
+    if [ -x "${MODKIT_CLI}" ]; then
+      "${MODKIT_CLI}" sync || true
+    fi
+    reload_pveproxy
+    activate_dir_key
+    exit 0
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

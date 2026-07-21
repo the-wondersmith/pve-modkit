@@ -1,0 +1,7 @@
+{
+  "name": "demo-logo-glow",
+  "version": "1.0.0",
+  "description": "Demo mod: a soft breathing orange glow on the Proxmox VE logo.",
+  "entry": "index.js",
+  "enabled": true
+}

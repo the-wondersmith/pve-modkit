@@ -1,0 +1,38 @@
+# Perl::Tidy configuration for pve-modkit.
+#
+# Enforced by `mise run lint:perltidy`:
+#   - CI  (vars.ci == true): check-only, non-zero exit on any needed change.
+#   - local: rewrites files in place (autofix).
+# Perl::Critic's RequireTidyCode policy also consults this file.
+
+# --- Indentation & width ---
+--indent-columns=4          # 4-space indents
+--maximum-line-length=100   # generous but bounded
+--continuation-indentation=4
+
+# --- Braces & blocks ---
+--brace-tightness=2         # snug braces: { foo }
+--block-brace-tightness=0
+--paren-tightness=1
+--square-bracket-tightness=1
+--brace-vertical-tightness=0
+--cuddled-else              # } elsif { / } else { on one line
+
+# --- Vertical alignment / whitespace ---
+--no-blanks-before-comments
+--maximum-consecutive-blank-lines=1
+--nospace-for-semicolon
+--add-semicolons
+--delete-semicolons
+
+# --- Line breaking ---
+--nooutdent-long-lines
+--break-at-old-comma-breakpoints
+--break-at-old-keyword-breakpoints
+--break-at-old-logical-breakpoints
+
+# --- Safety / cleanliness ---
+--backup-and-modify-in-place
+--backup-file-extension=/   # delete the .bak after a successful run
+--warning-output
+--nostandard-output

@@ -1,0 +1,47 @@
+{
+  "name": "pve-modkit-dev",
+  "image": "mcr.microsoft.com/devcontainers/base:trixie",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "installZsh": true,
+      "installOhMyZsh": false,
+      "upgradePackages": true,
+      "nonFreePackages": false,
+      "installOhMyZshConfig": false,
+      "configureZshAsDefaultShell": true
+    },
+    "ghcr.io/devcontainers-extra/features/mise:1": {}
+  },
+  "overrideFeatureInstallOrder": [
+    "ghcr.io/devcontainers/features/github-cli",
+    "ghcr.io/devcontainers/features/common-utils",
+    "ghcr.io/devcontainers-extra/features/mise"
+  ],
+  "init": true,
+  "mounts": [
+    {
+      "type": "volume",
+      "source": "mise-data-volume",
+      "target": "/mnt/mise-data"
+    }
+  ],
+  "containerEnv": {
+    "MISE_GITHUB_TOKEN": "${localEnv:MISE_GITHUB_TOKEN}",
+    "MISE_DATA_DIR": "/mnt/mise-data/mise",
+    "PRE_COMMIT_HOME": "/mnt/mise-data/pre-commit"
+  },
+  "remoteEnv": {
+    "PATH": "${containerEnv:PATH}:/mnt/mise-data/mise/shims"
+  },
+  "postCreateCommand": "sudo chown -R vscode:vscode /mnt/mise-data && .devcontainer/postCreateCommand.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "EditorConfig.EditorConfig",
+        "hverlin.mise-vscode",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  }
+}
