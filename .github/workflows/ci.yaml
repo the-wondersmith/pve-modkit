@@ -60,7 +60,7 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y --no-install-recommends \
-            dpkg-dev debhelper libppi-perl libtemplate-perl
+            build-essential dpkg-dev debhelper libppi-perl libtemplate-perl
 
       - name: Prepare CI Environment
         uses: ./.github/actions/prepare-ci-env
