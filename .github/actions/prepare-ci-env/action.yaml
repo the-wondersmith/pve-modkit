@@ -24,6 +24,16 @@ runs:
         env: false  # Do not load the environment section from `mise.toml` into GITHUB_ENV
         install: true
 
+    - name: Install Node dependencies
+      id: install_node_deps
+      shell: bash
+      # node/npm come from mise (see mise.toml [tools] node), installed+activated
+      # by the mise step above. `node_modules/` is gitignored, so CI has no
+      # project deps by default. Without this, `npx eslint` (pre-commit hook +
+      # `mise run lint:js`) would fetch the latest ESLint instead of the
+      # package-lock-pinned version and fail to resolve `require('@eslint/js')`.
+      run: npm ci --no-audit --no-fund
+
     - name: Cache pre-commit hooks
       id: cache_pre_commit
       uses: actions/cache@v4

@@ -17,6 +17,10 @@ ci = "{{ env.CI is defined and env.CI == 'true' }}"
 [tools]
 actionlint = "1.7"
 editorconfig-checker = "3"
+# node provides npm for the JS toolchain (ESLint flat config in eslint.config.js
+# + the committed package-lock.json). Routed through mise so tooling stays
+# consistent across CI, build box, and dev machines (no out-of-band setup-node).
+node = "24"
 # perl provides the runtime for the pve-modkit CLI's lazily-required Template
 # and PPI modules (see the postinstall hook above). Ungated: mise is the single
 # source of truth for tooling on every host (CI, build box, dev machines).
