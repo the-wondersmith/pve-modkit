@@ -19,7 +19,7 @@ runs:
 
     - name: Install `mise`
       id: install_mise
-      uses: jdx/mise-action@v3
+      uses: jdx/mise-action@v4
       with:
         env: false  # Do not load the environment section from `mise.toml` into GITHUB_ENV
         install: true
@@ -36,7 +36,7 @@ runs:
 
     - name: Cache pre-commit hooks
       id: cache_pre_commit
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         lookup-only: ${{ inputs.cache-only == 'true' }}
         path: ~/.cache/pre-commit
