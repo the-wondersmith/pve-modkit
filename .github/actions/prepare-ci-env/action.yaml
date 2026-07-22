@@ -13,13 +13,13 @@ runs:
   steps:
     - name: Set up Python
       id: install_python
-      uses: actions/setup-python@v7
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
       with:
         python-version: '3.14'
 
     - name: Install `mise`
       id: install_mise
-      uses: jdx/mise-action@v4
+      uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea  # v4
       with:
         env: false  # Do not load the environment section from `mise.toml` into GITHUB_ENV
         install: true
@@ -36,7 +36,7 @@ runs:
 
     - name: Cache pre-commit hooks
       id: cache_pre_commit
-      uses: actions/cache@v6
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
       with:
         lookup-only: ${{ inputs.cache-only == 'true' }}
         path: ~/.cache/pre-commit
