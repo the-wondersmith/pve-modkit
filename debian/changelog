@@ -1,3 +1,11 @@
+pve-modkit (0.1.1) trixie; urgency=low
+
+  * Validation release: exercise the provenance-verified ingest chain
+    (SLSA build attestation, signed pool manifest, signed provenance log).
+    No functional code changes.
+
+ -- Mark S. <the@wondersmith.dev>  Wed, 22 Jul 2026 12:00:00 -0400
+
 pve-modkit (0.1.0) trixie; urgency=low
 
   * Initial release.
