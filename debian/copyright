@@ -2,7 +2,7 @@ Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: pve-modkit
 
 Files: *
-Copyright: 2026 Mark S. <the@wondermsith.dev>
+Copyright: 2026 Mark S. <the@wondersmith.dev>
 License: AGPL-3.0+
 
 License: AGPL-3.0+

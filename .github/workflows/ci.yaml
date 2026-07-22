@@ -94,6 +94,8 @@ jobs:
 
     permissions:
       contents: write
+      id-token: write        # mint the OIDC token that signs the attestation
+      attestations: write    # publish the provenance attestation to the repo
 
     steps:
       - name: Download .deb artifact
@@ -101,6 +103,15 @@ jobs:
         with:
           name: pve-modkit-deb
           path: dist
+
+      # Generate a SLSA build-provenance attestation bound to the exact .deb
+      # bytes that get released. The APT control plane verifies this (pinned to
+      # this workflow's signer identity) before it will ingest the package, so
+      # an artifact that wasn't built here is rejected at the door.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*.deb
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
