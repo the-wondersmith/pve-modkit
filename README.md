@@ -134,16 +134,32 @@ finds** as its own served key (`/modkit/<mod>/`). So each mod's folder is served
 
 ## Installing the kit
 
-Build the Debian package and install it:
+> [!IMPORTANT]
+> Never install packages from sources/repositories you don't/can't verify independantly.
+
+### Via `apt`
+
+Add [`the-wondersmith/apt`](https://github.com/the-wondersmith/apt) to your local repositories:
 
 ```sh
-cd pve-modkit
-dpkg-buildpackage -us -uc -b
-apt install ../pve-modkit_0.1.0_all.deb
+curl -fsSL 'https://the-wondersmith.github.io/apt/bootstrap.tgz' \
+| sudo tar -C / -xzf - && sudo apt update && sudo apt install -y \
+pve-modkit wondersmith-apt-keyring
 ```
 
-Dependencies (pulled in automatically): `libtemplate-perl`, `libppi-perl`,
-`pve-manager`. JSON handling uses `JSON::PP`, which ships with core Perl.
+`pve-modkit` (and all packages in `the-wondersmith/apt`) are [built](.github/workflows/ci.yaml#L107) with SLSA build-provenance attestation
+attached and [enforced](https://github.com/the-wondersmith/apt/blob/main/.github/workflows/publish.yaml#L334) by the repository's publishing
+machinery.
+
+### From Releases
+
+Download the most recent `.deb` from [releases](https://github.com/the-wondersmith/pve-modkit/releases), then install it manually:
+
+```sh
+apt install path/to/pve-modkit.deb
+```
+
+### Post-Install Notes
 
 On install the package:
 
