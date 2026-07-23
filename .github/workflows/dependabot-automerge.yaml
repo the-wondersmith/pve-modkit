@@ -44,7 +44,7 @@ jobs:
           pr_number="$(gh pr list --repo "${GITHUB_REPOSITORY}" \
             --head "${HEAD_BRANCH}" --state open \
             --json number,author,headRefOid \
-            --jq '.[] | select(.author.login == "dependabot[bot]") | select(.headRefOid == "'"${HEAD_SHA}"'") | .number' \
+            --jq '.[] | select(.author.login == "app/dependabot" or .author.login == "dependabot[bot]") | select(.headRefOid == "'"${HEAD_SHA}"'") | .number' \
             | head -n1)"
           if [ -z "${pr_number}" ]; then
             echo "::notice::no matching open Dependabot PR for ${HEAD_BRANCH}@${HEAD_SHA}; nothing to do"
